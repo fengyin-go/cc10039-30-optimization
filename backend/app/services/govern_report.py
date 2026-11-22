@@ -2,9 +2,14 @@
 
 治理报告是跨模块数据流的最终汇聚点：汇总冷热分层迁移、小文件合并、
 保留策略清理、质量监控结果和血缘链路状态，生成综合治理报告。
+
+血缘部分读取血缘待验证数据明细（lineage_graph 每条记录的 `验证明细`），
+生成按照实际下游产物核对的复查项。报告统计和血缘明细使用同一批已确认
+的证据：生成开始时冻结一份明细快照，待验数量能沿明细逐条数出来。
 """
 from __future__ import annotations
 
+import copy
 import datetime
 from typing import Any
 
@@ -51,10 +56,45 @@ class GovernReportService(BaseModuleService):
         quality_failures = [e for e in quality_events if e["event_type"] == "quality_failed_to_lineage"]
         quality_passes = [e for e in quality_events if e["event_type"] == "quality_passed_to_govern"]
 
-        # 5) 汇总血缘链路状态
+        # 5) 汇总血缘链路状态：读取血缘待验证数据明细。
+        #    统计与复查项必须使用同一批已确认的证据——生成开始时冻结一份
+        #    明细快照；下游数据迟到撞上本轮生成时，复查范围仍沿明细数得出来。
         lineage_rows = store.rows("lineage_graph")
         broken_lineages = [l for l in lineage_rows if l.get("status") == "链路断裂"]
         uncertain_lineages = [l for l in lineage_rows if l.get("status") == "待验证"]
+
+        detail_snapshot: list[dict[str, Any]] = []
+        for lin in lineage_rows:
+            for det in lin.get("验证明细", []):
+                detail_snapshot.append({
+                    "血缘ID": lin.get("id"),
+                    **copy.deepcopy(det),
+                })
+
+        pending_details = [d for d in detail_snapshot if d.get("状态") == "待验证"]
+        confirmed_details = [d for d in detail_snapshot if d.get("状态") == "已确认"]
+
+        # 复查项：按实际下游产物核对，值班员据此决定现在复查哪一段
+        recheck_items = [
+            {
+                "血缘ID": d.get("血缘ID"),
+                "明细ID": d.get("明细ID"),
+                "复查段": d.get("段"),
+                "下游分支": d.get("分支"),
+                "路径": d.get("路径"),
+                "结论": d.get("结论"),
+                "实际下游产物数": d.get("观测产物数", 0),
+                "证据批次": d.get("证据批次"),
+                "复查建议": (
+                    f"核对 {d.get('路径')} 的实际下游产物"
+                    f"（当次可见 {d.get('观测产物数', 0)} 条，{d.get('结论')}）"
+                ),
+            }
+            for d in pending_details
+        ]
+        evidence_batches = sorted({
+            d.get("证据批次") for d in detail_snapshot if d.get("证据批次")
+        })
 
         # 6) 汇总回填任务
         backfill_events = store.events_for_module("backfill_job")
@@ -80,7 +120,12 @@ class GovernReportService(BaseModuleService):
                 "broken": len(broken_lineages),
                 "uncertain": len(uncertain_lineages),
                 "healthy": len(lineage_rows) - len(broken_lineages) - len(uncertain_lineages),
+                "明细总数": len(detail_snapshot),
+                "已确认段数": len(confirmed_details),
+                "待验证段数": len(recheck_items),
+                "证据批次": evidence_batches,
             },
+            "血缘复查项": recheck_items,
             "backfill_summary": {
                 "completed_backfills": len(completed_backfills),
             },
@@ -90,6 +135,8 @@ class GovernReportService(BaseModuleService):
         suggestions = []
         if len(broken_lineages) > 0:
             suggestions.append(f"修复 {len(broken_lineages)} 条断裂血缘链路")
+        if recheck_items:
+            suggestions.append(f"复查 {len(recheck_items)} 段血缘待验证明细（见血缘复查项）")
         if len(quality_failures) > 0:
             suggestions.append(f"处理 {len(quality_failures)} 个质量不达标指标")
         if total_migrated > 0:
@@ -102,6 +149,8 @@ class GovernReportService(BaseModuleService):
         entry["abnormal"] = False
         entry["优化建议"] = "；".join(suggestions) if suggestions else "当前治理状态良好"
         entry["执行状态"] = "报告已生成"
+        entry["血缘复查项"] = recheck_items
+        entry["治理数据"] = report_data
 
         store.log_event("govern_report_generated", "govern_report", "govern_report", {
             "report_id": entry_id,
@@ -110,7 +159,8 @@ class GovernReportService(BaseModuleService):
 
         return entry, (
             f"治理报告已生成：迁移分区={total_migrated}，质量检查={len(quality_passes) + len(quality_failures)}，"
-            f"血缘链路={len(lineage_rows)}，回填任务={len(completed_backfills)}"
+            f"血缘链路={len(lineage_rows)}，血缘待验证段={len(recheck_items)}，"
+            f"回填任务={len(completed_backfills)}"
         )
 
     def execute_optimization(self, entry_id: int) -> tuple[dict[str, Any] | None, str]:
